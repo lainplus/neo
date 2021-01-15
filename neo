@@ -1,0 +1,141 @@
+#!/usr/bin/env sh
+
+VERSION="1.0.0"
+
+# cache directory. everything related to neo is stored in here
+# once the computer gets restarted, this directory gets deleted
+NEO_DIR="/tmp/neo"
+
+# the phone number that is selected gets stored in here
+NEO_PHONE_NUMBER="$NEO_DIR/phonenumber.txt"
+
+# fzf is used for selecting a phone number
+# if you want you can put arguments in here for fzf
+FZF_ARGUMENTS=""
+
+# the temporary sms service is provided by upmasked
+API="https://upmasked.com"
+
+usage(){
+	cat <<EOF
+neo [--count <number>]
+neo init [--fzf <arguments>]
+neo -h | --version
+
+when called with no options or commands, neo
+lists the three newest messages.
+
+options
+-h, --help		you are here
+-c, --count		only show the <number> amount of messages, sorted by newest
+--version		show version
+
+commands
+init			initialize a new phone number by selecting one from the available
+				ones using fzf
+  --fzf			extra arguments to use for fzf
+EOF
+}
+
+print_error(){
+	printf "%s\n" "error: $1" >&2
+	exit 1
+}
+
+select_phone_number(){
+	EXTERNALLY=${1:-false}
+	DATA=$(curl -s "$API/api/sms/numbers")
+	DATA_LENGTH=$(printf %s "$DATA" | jq length)
+	PHONE_NUMBERS=""
+
+	index=1
+	while [ $index -le "$DATA_LENGTH" ]; do
+		PHONE_NUMBER_INFO=$(printf %s "$DATA" | jq -r ".[$index-1]")
+		PHONE_NUMBER=$(printf %s "$PHONE_NUMBER_INFO" | jq -r ".number")
+        COUNTRY_CODE=$(printf %s "$PHONE_NUMBER_INFO" | jq -r ".country")
+
+        PHONE_NUMBERS="$PHONE_NUMBERS$COUNTRY_CODE +$PHONE_NUMBER\n"
+        index=$((index+1))
+    done
+
+	FZF_COMMAND="fzf"
+	[ -n "$FZF_ARGUMENTS" ] && FZF_COMMAND="fzf $FZF_ARGUMENTS"
+
+	SELECTION=$(printf %b "$PHONE_NUMBERS" | $FZF_COMMAND)
+	[ -z "$SELECTION" ] && print_error "phone number was not selected"
+
+	printf %s "$SELECTION" > "$NEO_PHONE_NUMBER"
+
+	[ "$EXTERNALLY" = true ] && printf "%s\n" "$SELECTION"
+}
+
+list_messages(){
+	COUNT="${1:-3}"
+
+	REGEX='^[0-9]+$'
+	if ! printf %s "$COUNT" | grep -Eq "$REGEX";then
+		print_error "'$COUNT' is not an integer"
+	fi
+
+	[ ! -s "$NEO_PHONE_NUMBER" ] && print_error "a phone number must be initialized in order to view the messages"
+
+	COUNTRY_CODE=$(awk -F" " '{print $1}' < $NEO_PHONE_NUMBER)
+	PHONE_NUMBER=$(awk -F"+" '{print $2}' < $NEO_PHONE_NUMBER)
+	DATA=$(curl -s "$API/api/sms/messages/$PHONE_NUMBER")
+
+	if printf %s "$DATA" | grep -Eq "Not Found"; then
+		print_error "the phone number '+$PHONE_NUMBER' doesn't exist anymore. initialize a new one and try again"
+	fi
+
+	DATA_LENGTH=$(printf %s "$DATA" | jq length)
+
+	[ "$COUNT" -gt "$DATA_LENGTH" ] && COUNT="$DATA_LENGTH"
+
+	printf "%s\n\n" "[ messages for +$PHONE_NUMBER ($COUNTRY_CODE) ]"
+
+	MESSAGES=""
+
+	index=1
+	while [ $index -le "$COUNT" ]; do
+		MESSAGE_DATA=$(printf %s "$DATA" | jq -r ".[$index-1]")
+		BODY=$(printf %s "$MESSAGE_DATA" | jq -r ".body" | tr "\n" " ")
+		SENDER=$(printf %s "$MESSAGE_DATA" | jq -r ".originator")
+
+		MESSAGES="$MESSAGES$SENDER ||$BODY\n"
+
+		index=$((index+1))
+	done
+
+	printf "%b" "$MESSAGES" | column -t -s "||"
+}
+
+main(){
+	for dependency in jq curl fzf; do
+		if ! command -v "$dependency" >/dev/null 2>&1; then
+			print_error "could not find '$dependency', install it before using neo"
+		fi
+	done
+
+	mkdir -p "$NEO_DIR"
+
+	[ $# -eq 0 ] && list_messages && exit 0
+
+	while [ "$1" ]; do
+		case "$1" in
+			init)
+				case "$2" in
+					--fzf) FZF_ARGUMENTS="$3" && select_phone_number true ;;
+					"") select_phone_number true ;;
+				esac ;;
+			--help | -h) usage && exit;;
+			--count | -c) list_messages "$2" && shift 2;;
+			--version) printf %s "$VERSION" && exit ;;
+			-*) print_error "option '$1' does not exist" ;;
+			*) print_error "command '$1' does not exist" ;;
+		esac
+		shift
+	done
+}
+
+main "$@"
+
